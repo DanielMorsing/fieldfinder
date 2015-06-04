@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"go/token"
+	_ "math/big"
 	"os"
 
 	"golang.org/x/tools/go/loader"
@@ -9,6 +11,10 @@ import (
 	"golang.org/x/tools/go/ssa/ssautil"
 	"golang.org/x/tools/go/types"
 )
+
+var nodetype types.Type
+var opfield int
+var numFields int
 
 func main() {
 	lconf := loader.Config{}
@@ -19,20 +25,135 @@ func main() {
 	}
 	sprog := ssautil.CreateProgram(lprog, 0)
 	sprog.BuildAll()
-	nodtyp := findNodeType(sprog)
-
+	findNodeType(sprog)
+	var consts []*constraint
+	for f := range ssautil.AllFunctions(sprog) {
+		for _, b := range f.Blocks {
+			for _, i := range b.Instrs {
+				consts = generateConstraints(i, consts)
+			}
+		}
+	}
+	for _, c := range consts {
+		fmt.Println(c.typedFrom)
+	}
 }
 
-func findNodeType(sprog *ssa.Program) types.Type {
+func generateConstraints(i ssa.Instruction, consts []*constraint) []*constraint {
+	switch field := i.(type) {
+	case *ssa.Field:
+		if field.X.Type() != nodetype || field.Field != opfield {
+			return consts
+		}
+		for _, r := range *field.Referrers() {
+			binop := toCmp(r)
+			if binop == nil {
+				continue
+			}
+			op := binop.X
+			if binop.X != field {
+				op = binop.Y
+			}
+			for _, r := range *binop.Referrers() {
+				if jmp, _ := r.(*ssa.If); jmp != nil {
+					bb := jmp.Block()
+					var tblock *ssa.BasicBlock
+					tblock = bb.Succs[0]
+					if binop.Op == token.NEQ {
+						tblock = bb.Succs[1]
+					}
+					consts = append(consts, &constraint{
+						val: field.X,
+						op: op,
+						typedFrom: tblock,
+					})
+				}
+			}
+		}
+	case *ssa.FieldAddr:
+		if field.X.Type().Underlying().(*types.Pointer).Elem() != nodetype || field.Field != opfield {
+			return consts
+		}
+		for _, r := range *field.Referrers() {
+			if unop, ok := r.(*ssa.UnOp); ok && unop.Op == token.MUL {
+				for _, r := range *unop.Referrers() {
+					binop := toCmp(r)
+					if binop == nil {
+						continue
+					}
+					op := binop.X
+					if binop.X != unop {
+						op = binop.Y
+					}
+					for _, r := range *binop.Referrers() {
+						if jmp, _ := r.(*ssa.If); jmp != nil {
+							bb := jmp.Block()
+							var tblock *ssa.BasicBlock
+							tblock = bb.Succs[0]
+							if binop.Op == token.NEQ {
+								tblock = bb.Succs[1]
+							}
+							consts = append(consts, &constraint{
+								val: field.X,
+								op: op,
+								typedFrom: tblock,
+							})
+						}
+					}
+				}
+			}
+		}
+	}
+	return consts
+}
+
+func toCmp(r ssa.Instruction) *ssa.BinOp {
+	binop, ok := r.(*ssa.BinOp)
+	if !ok {
+		return nil
+	}
+	if !isBoolean(binop.Type()) {
+		return nil
+	}
+	if binop.Op != token.EQL && binop.Op != token.NEQ {
+		return nil
+	}
+	return binop
+}
+
+func isBoolean(t types.Type) bool {
+	tb, _ := t.Underlying().(*types.Basic)
+	return tb != nil && tb.Kind() == types.Bool
+}
+
+type constraint struct {
+	val       ssa.Value
+	op        ssa.Value
+	typedFrom *ssa.BasicBlock
+}
+
+func findNodeType(sprog *ssa.Program) {
 	pkg := sprog.ImportedPackage("cmd/compile/internal/gc")
 	if pkg == nil {
 		fatalln("could not find cmd/compile/internal/gc in ssa")
 	}
-	typ := pkg.Type("Node")
-	if pkg == nil {
+	obj := pkg.Type("Node")
+	if obj == nil {
 		fatalln("could not find Node in ssa")
 	}
-	return typ.Type()
+	typ := obj.Type()
+	structtype := typ.Underlying().(*types.Struct)
+	numFields = structtype.NumFields()
+
+	for i := 0; i < numFields; i++ {
+		f := structtype.Field(i)
+		if f.Name() == "Op" {
+			nodetype = typ
+			opfield = i
+			return
+		}
+	}
+	fatalln("could not find Op field")
 }
 
 func fatalf(s string, i ...interface{}) {
