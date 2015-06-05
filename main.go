@@ -34,9 +34,8 @@ func main() {
 			}
 		}
 	}
-	for _, c := range consts {
-		fmt.Println(c.typedFrom)
-	}
+	c := consts[0]
+	dumpFields(c)
 }
 
 func generateConstraints(i ssa.Instruction, consts []*constraint) []*constraint {
@@ -46,62 +45,45 @@ func generateConstraints(i ssa.Instruction, consts []*constraint) []*constraint 
 			return consts
 		}
 		for _, r := range *field.Referrers() {
-			binop := toCmp(r)
-			if binop == nil {
-				continue
-			}
-			op := binop.X
-			if binop.X != field {
-				op = binop.Y
-			}
-			for _, r := range *binop.Referrers() {
-				if jmp, _ := r.(*ssa.If); jmp != nil {
-					bb := jmp.Block()
-					var tblock *ssa.BasicBlock
-					tblock = bb.Succs[0]
-					if binop.Op == token.NEQ {
-						tblock = bb.Succs[1]
-					}
-					consts = append(consts, &constraint{
-						val: field.X,
-						op: op,
-						typedFrom: tblock,
-					})
-				}
-			}
+			consts = findJumpsOnCmp(r, field, field.X, consts)
 		}
 	case *ssa.FieldAddr:
 		if field.X.Type().Underlying().(*types.Pointer).Elem() != nodetype || field.Field != opfield {
 			return consts
 		}
 		for _, r := range *field.Referrers() {
-			if unop, ok := r.(*ssa.UnOp); ok && unop.Op == token.MUL {
-				for _, r := range *unop.Referrers() {
-					binop := toCmp(r)
-					if binop == nil {
-						continue
-					}
-					op := binop.X
-					if binop.X != unop {
-						op = binop.Y
-					}
-					for _, r := range *binop.Referrers() {
-						if jmp, _ := r.(*ssa.If); jmp != nil {
-							bb := jmp.Block()
-							var tblock *ssa.BasicBlock
-							tblock = bb.Succs[0]
-							if binop.Op == token.NEQ {
-								tblock = bb.Succs[1]
-							}
-							consts = append(consts, &constraint{
-								val: field.X,
-								op: op,
-								typedFrom: tblock,
-							})
-						}
-					}
+			if load, ok := r.(*ssa.UnOp); ok && load.Op == token.MUL {
+				for _, r := range *load.Referrers() {
+					consts = findJumpsOnCmp(r, load, field.X, consts)
 				}
 			}
+		}
+	}
+	return consts
+}
+
+func findJumpsOnCmp(instr ssa.Instruction, load ssa.Value, base ssa.Value, consts []*constraint) []*constraint {
+	binop := toCmp(instr)
+	if binop == nil {
+		return consts
+	}
+	op := binop.X
+	if binop.X != load {
+		op = binop.Y
+	}
+	for _, r := range *binop.Referrers() {
+		if jmp, _ := r.(*ssa.If); jmp != nil {
+			bb := jmp.Block()
+			var tblock *ssa.BasicBlock
+			tblock = bb.Succs[0]
+			if binop.Op == token.NEQ {
+				tblock = bb.Succs[1]
+			}
+			consts = append(consts, &constraint{
+				val:       base,
+				op:        op,
+				typedFrom: tblock,
+			})
 		}
 	}
 	return consts
@@ -130,6 +112,9 @@ type constraint struct {
 	val       ssa.Value
 	op        ssa.Value
 	typedFrom *ssa.BasicBlock
+}
+
+func dumpFields(c *constraint) {
 }
 
 func findNodeType(sprog *ssa.Program) {
