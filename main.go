@@ -3,9 +3,10 @@ package main
 import (
 	"fmt"
 	"go/token"
-	_ "math/big"
+	"math/big"
 	"os"
 
+	"golang.org/x/tools/go/exact"
 	"golang.org/x/tools/go/loader"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
@@ -14,7 +15,8 @@ import (
 
 var nodetype types.Type
 var opfield int
-var numFields int
+
+var fieldstouched = make([]big.Int, 300)
 
 func main() {
 	lconf := loader.Config{}
@@ -34,8 +36,23 @@ func main() {
 			}
 		}
 	}
-	c := consts[0]
-	dumpFields(c)
+	for _, c := range consts {
+		findFieldAccesses(c)
+	}
+	for i, b := range fieldstouched {
+		fmt.Printf("%d\n", i)
+		printFields(&b)
+	}
+}
+
+func printFields(b *big.Int) {
+	blen := b.BitLen()
+	structtype := nodetype.Underlying().(*types.Struct)
+	for i := 0; i < blen; i++ {
+		if b.Bit(i) == 1 {
+			fmt.Printf("\t%s\n", structtype.Field(i).Name())
+		}
+	}
 }
 
 func generateConstraints(i ssa.Instruction, consts []*constraint) []*constraint {
@@ -68,9 +85,14 @@ func findJumpsOnCmp(instr ssa.Instruction, load ssa.Value, base ssa.Value, const
 		return consts
 	}
 	op := binop.X
-	if binop.X != load {
+	if binop.X == load {
 		op = binop.Y
 	}
+	constval, _ := op.(*ssa.Const)
+	if constval == nil {
+		return consts
+	}
+	val, _ := exact.Int64Val(constval.Value)
 	for _, r := range *binop.Referrers() {
 		if jmp, _ := r.(*ssa.If); jmp != nil {
 			bb := jmp.Block()
@@ -81,7 +103,7 @@ func findJumpsOnCmp(instr ssa.Instruction, load ssa.Value, base ssa.Value, const
 			}
 			consts = append(consts, &constraint{
 				val:       base,
-				op:        op,
+				op:        int(val),
 				typedFrom: tblock,
 			})
 		}
@@ -110,11 +132,47 @@ func isBoolean(t types.Type) bool {
 
 type constraint struct {
 	val       ssa.Value
-	op        ssa.Value
+	op        int
 	typedFrom *ssa.BasicBlock
 }
 
-func dumpFields(c *constraint) {
+func findFieldAccesses(c *constraint) {
+	blocks := make(map[*ssa.BasicBlock]bool)
+	blocks[c.typedFrom] = true
+	blockAdded := true
+	for blockAdded {
+		blockAdded = false
+		for bb := range blocks {
+			for _, s := range bb.Succs {
+				if !blocks[s] {
+					blocks[s] = true
+					blockAdded = true
+				}
+			}
+		}
+	}
+	set := &fieldstouched[c.op]
+	for _, r := range *c.val.Referrers() {
+		findex := 0
+		switch f := r.(type) {
+		case *ssa.Field:
+			findex = f.Field
+			if f.Field == opfield {
+				continue
+			}
+		case *ssa.FieldAddr:
+			findex = f.Field
+			if f.Field == opfield {
+				continue
+			}
+		default:
+			continue
+		}
+		if !blocks[r.Block()] {
+			continue
+		}
+		set.SetBit(set, findex, 1)
+	}
 }
 
 func findNodeType(sprog *ssa.Program) {
@@ -128,7 +186,8 @@ func findNodeType(sprog *ssa.Program) {
 	}
 	typ := obj.Type()
 	structtype := typ.Underlying().(*types.Struct)
-	numFields = structtype.NumFields()
+	numFields := structtype.NumFields()
+	fieldstouched = make([]big.Int, 300)
 
 	for i := 0; i < numFields; i++ {
 		f := structtype.Field(i)
