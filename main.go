@@ -6,7 +6,6 @@ import (
 	"math/big"
 	"os"
 
-	"golang.org/x/tools/go/exact"
 	"golang.org/x/tools/go/loader"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
@@ -74,6 +73,18 @@ func generateConstraints(i ssa.Instruction, consts []*constraint) []*constraint 
 					consts = findJumpsOnCmp(r, load, field.X, consts)
 				}
 			}
+			if store, ok := r.(*ssa.Store); ok {
+				constval, _ := store.Val.(*ssa.Const)
+				if constval == nil {
+					continue
+				}
+				val := constval.Int64()
+				consts = append(consts, &constraint{
+					val:       field.X,
+					op:        int(val),
+					typedFrom: store.Block(),
+				})
+			}
 		}
 	}
 	return consts
@@ -92,7 +103,7 @@ func findJumpsOnCmp(instr ssa.Instruction, load ssa.Value, base ssa.Value, const
 	if constval == nil {
 		return consts
 	}
-	val, _ := exact.Int64Val(constval.Value)
+	val := constval.Int64()
 	for _, r := range *binop.Referrers() {
 		if jmp, _ := r.(*ssa.If); jmp != nil {
 			bb := jmp.Block()
