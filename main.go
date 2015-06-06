@@ -148,20 +148,6 @@ type constraint struct {
 }
 
 func findFieldAccesses(c *constraint) {
-	blocks := make(map[*ssa.BasicBlock]bool)
-	blocks[c.typedFrom] = true
-	blockAdded := true
-	for blockAdded {
-		blockAdded = false
-		for bb := range blocks {
-			for _, s := range bb.Succs {
-				if !blocks[s] {
-					blocks[s] = true
-					blockAdded = true
-				}
-			}
-		}
-	}
 	set := &fieldstouched[c.op]
 	for _, r := range *c.val.Referrers() {
 		findex := 0
@@ -179,7 +165,7 @@ func findFieldAccesses(c *constraint) {
 		default:
 			continue
 		}
-		if !blocks[r.Block()] {
+		if !c.typedFrom.Dominates(r.Block()) {
 			continue
 		}
 		set.SetBit(set, findex, 1)
