@@ -116,6 +116,9 @@ func findJumpsOnCmp(instr ssa.Instruction, load ssa.Value, base ssa.Value, const
 			if binop.Op == token.NEQ {
 				tblock = bb.Succs[1]
 			}
+			if !bb.Dominates(tblock) {
+				continue
+			}
 			consts = append(consts, &constraint{
 				val:       base,
 				op:        int(val),
