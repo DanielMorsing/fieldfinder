@@ -2,10 +2,12 @@ package main
 
 import (
 	"fmt"
+	"go/ast"
 	"go/token"
 	"math/big"
 	"os"
 
+	"golang.org/x/tools/go/exact"
 	"golang.org/x/tools/go/loader"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
@@ -16,6 +18,7 @@ var nodetype types.Type
 var opfield int
 
 var fieldstouched = make([]big.Int, 300)
+var names = make([]string, 300)
 
 func main() {
 	lconf := loader.Config{}
@@ -26,7 +29,7 @@ func main() {
 	}
 	sprog := ssautil.CreateProgram(lprog, 0)
 	sprog.BuildAll()
-	findNodeType(sprog)
+	findNodeType(sprog, lprog)
 	var consts []*constraint
 	for f := range ssautil.AllFunctions(sprog) {
 		for _, b := range f.Blocks {
@@ -35,11 +38,12 @@ func main() {
 			}
 		}
 	}
+
 	for _, c := range consts {
 		findFieldAccesses(c)
 	}
 	for i, b := range fieldstouched {
-		fmt.Printf("%d\n", i)
+		fmt.Printf("%s\n", names[i])
 		printFields(&b)
 	}
 }
@@ -172,7 +176,7 @@ func findFieldAccesses(c *constraint) {
 	}
 }
 
-func findNodeType(sprog *ssa.Program) {
+func findNodeType(sprog *ssa.Program, lprog *loader.Program) {
 	pkg := sprog.ImportedPackage("cmd/compile/internal/gc")
 	if pkg == nil {
 		fatalln("could not find cmd/compile/internal/gc in ssa")
@@ -184,7 +188,28 @@ func findNodeType(sprog *ssa.Program) {
 	typ := obj.Type()
 	structtype := typ.Underlying().(*types.Struct)
 	numFields := structtype.NumFields()
-	fieldstouched = make([]big.Int, 300)
+
+	lpkg := lprog.Package("cmd/compile/internal/gc")
+	for _, f := range lpkg.Files {
+		for _, d := range f.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				continue
+			}
+			decl := gd.Specs[0].(*ast.ValueSpec)
+			if decl.Names[0].Name != "OXXX" {
+				continue
+			}
+			var val int64
+			for _, s := range gd.Specs {
+				decl := s.(*ast.ValueSpec)
+				val, _ = exact.Int64Val(lpkg.Info.Defs[decl.Names[0]].(*types.Const).Val())
+				names[val] = decl.Names[0].Name
+			}
+			fieldstouched = fieldstouched[:val]
+			names = names[:val]
+		}
+	}
 
 	for i := 0; i < numFields; i++ {
 		f := structtype.Field(i)
