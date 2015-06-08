@@ -15,14 +15,18 @@ import (
 	"golang.org/x/tools/go/types"
 )
 
-var nodetype types.Type
-var opfield int
-
-var fieldstouched []big.Int
-var names []string
-
 var printDeductions = flag.Bool("deduce", false, "print various deductions based on constraints")
 var printTypes = flag.Bool("types", false, "print final types")
+
+type context struct {
+	loaderprog    *loader.Program
+	ssaprog       *ssa.Program
+	constraints   []*constraint
+	nodetype      types.Type
+	opField       int
+	opNames       []string
+	fieldsTouched []big.Int
+}
 
 func main() {
 	flag.Parse()
@@ -34,25 +38,28 @@ func main() {
 	}
 	sprog := ssautil.CreateProgram(lprog, 0)
 	sprog.BuildAll()
-	findNodeType(sprog, lprog)
-	var consts []*constraint
+	ctx := &context{
+		loaderprog: lprog,
+		ssaprog:    sprog,
+	}
+	ctx.findNodeType()
 	for f := range ssautil.AllFunctions(sprog) {
 		for _, b := range f.Blocks {
 			for _, i := range b.Instrs {
-				consts = generateConstraints(i, consts)
+				ctx.generateConstraints(i)
 			}
 		}
 	}
 
-	for _, c := range consts {
-		findFieldAccesses(c)
+	for _, c := range ctx.constraints {
+		ctx.findFieldAccesses(c)
 	}
 	if *printDeductions {
-		for _, c := range consts {
+		for _, c := range ctx.constraints {
 			if len(c.accesses) == 0 {
 				continue
 			}
-			fmt.Printf("%s\n", names[c.op])
+			fmt.Printf("%s\n", ctx.opNames[c.op])
 			fmt.Printf("%s\n", lprog.Fset.Position(c.bound.Pos()))
 			for _, a := range c.accesses {
 				fmt.Printf("\t%s:%s\n", lprog.Fset.Position(a.Pos()), a.String())
@@ -60,8 +67,8 @@ func main() {
 		}
 	}
 	if *printTypes {
-		for _, c := range consts {
-			set := &fieldstouched[c.op]
+		for _, c := range ctx.constraints {
+			set := &ctx.fieldsTouched[c.op]
 			for _, a := range c.accesses {
 
 				findex := 0
@@ -76,16 +83,57 @@ func main() {
 				set.SetBit(set, findex, 1)
 			}
 		}
-		for i, f := range fieldstouched {
-			fmt.Printf("%s\n", names[i])
-			printFields(&f)
+		for i, f := range ctx.fieldsTouched {
+			fmt.Printf("%s\n", ctx.opNames[i])
+			ctx.printFields(&f)
 		}
 	}
 }
 
-func printFields(b *big.Int) {
+func (ctx *context) findNodeType() {
+	lpkg := ctx.loaderprog.Package("cmd/compile/internal/gc")
+	typ := lpkg.Pkg.Scope().Lookup("Node").(*types.TypeName).Type()
+	structtype := typ.Underlying().(*types.Struct)
+	numFields := structtype.NumFields()
+	for i := 0; i < numFields; i++ {
+		f := structtype.Field(i)
+		if f.Name() == "Op" {
+			ctx.nodetype = typ
+			ctx.opField = i
+			break
+		}
+	}
+
+	cspecs := findTypeConsts(lpkg.Files)
+	ctx.fieldsTouched = make([]big.Int, len(cspecs))
+	ctx.opNames = make([]string, len(cspecs))
+	for _, s := range cspecs {
+		decl := s.(*ast.ValueSpec)
+		val, _ := exact.Int64Val(lpkg.Info.Defs[decl.Names[0]].(*types.Const).Val())
+		ctx.opNames[val] = decl.Names[0].Name
+	}
+}
+
+func findTypeConsts(files []*ast.File) []ast.Spec {
+	for _, f := range files {
+		for _, d := range f.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				continue
+			}
+			decl := gd.Specs[0].(*ast.ValueSpec)
+			if decl.Names[0].Name == "OXXX" {
+				return gd.Specs
+			}
+		}
+	}
+	fatalln("could not find type consts")
+	panic("unreachable")
+}
+
+func (ctx *context) printFields(b *big.Int) {
 	blen := b.BitLen()
-	structtype := nodetype.Underlying().(*types.Struct)
+	structtype := ctx.nodetype.Underlying().(*types.Struct)
 	for i := 0; i < blen; i++ {
 		if b.Bit(i) == 1 {
 			fmt.Printf("\t%s\n", structtype.Field(i).Name())
@@ -93,23 +141,31 @@ func printFields(b *big.Int) {
 	}
 }
 
-func generateConstraints(i ssa.Instruction, consts []*constraint) []*constraint {
+type constraint struct {
+	val       ssa.Value
+	op        int
+	typedFrom *ssa.BasicBlock
+	bound     ssa.Instruction
+	accesses  []ssa.Value
+}
+
+func (ctx *context) generateConstraints(i ssa.Instruction) {
 	switch field := i.(type) {
 	case *ssa.Field:
-		if field.X.Type() != nodetype || field.Field != opfield {
-			return consts
+		if field.X.Type() != ctx.nodetype || field.Field != ctx.opField {
+			return
 		}
 		for _, r := range *field.Referrers() {
-			consts = findJumpsOnCmp(r, field, field.X, consts)
+			ctx.findJumpsOnCmp(r, field, field.X)
 		}
 	case *ssa.FieldAddr:
-		if field.X.Type().Underlying().(*types.Pointer).Elem() != nodetype || field.Field != opfield {
-			return consts
+		if field.X.Type().Underlying().(*types.Pointer).Elem() != ctx.nodetype || field.Field != ctx.opField {
+			return
 		}
 		for _, r := range *field.Referrers() {
 			if load, ok := r.(*ssa.UnOp); ok && load.Op == token.MUL {
 				for _, r := range *load.Referrers() {
-					consts = findJumpsOnCmp(r, load, field.X, consts)
+					ctx.findJumpsOnCmp(r, load, field.X)
 				}
 			}
 			if store, ok := r.(*ssa.Store); ok {
@@ -118,7 +174,7 @@ func generateConstraints(i ssa.Instruction, consts []*constraint) []*constraint 
 					continue
 				}
 				val := constval.Int64()
-				consts = append(consts, &constraint{
+				ctx.constraints = append(ctx.constraints, &constraint{
 					val:       field.X,
 					op:        int(val),
 					typedFrom: store.Block(),
@@ -127,13 +183,12 @@ func generateConstraints(i ssa.Instruction, consts []*constraint) []*constraint 
 			}
 		}
 	}
-	return consts
 }
 
-func findJumpsOnCmp(instr ssa.Instruction, load ssa.Value, base ssa.Value, consts []*constraint) []*constraint {
+func (ctx *context) findJumpsOnCmp(instr ssa.Instruction, load ssa.Value, base ssa.Value) {
 	binop := toCmp(instr)
 	if binop == nil {
-		return consts
+		return
 	}
 	op := binop.X
 	if binop.X == load {
@@ -141,7 +196,7 @@ func findJumpsOnCmp(instr ssa.Instruction, load ssa.Value, base ssa.Value, const
 	}
 	constval, _ := op.(*ssa.Const)
 	if constval == nil {
-		return consts
+		return
 	}
 	val := constval.Int64()
 	for _, r := range *binop.Referrers() {
@@ -155,7 +210,7 @@ func findJumpsOnCmp(instr ssa.Instruction, load ssa.Value, base ssa.Value, const
 			if !bb.Dominates(tblock) {
 				continue
 			}
-			consts = append(consts, &constraint{
+			ctx.constraints = append(ctx.constraints, &constraint{
 				val:       base,
 				op:        int(val),
 				typedFrom: tblock,
@@ -163,7 +218,7 @@ func findJumpsOnCmp(instr ssa.Instruction, load ssa.Value, base ssa.Value, const
 			})
 		}
 	}
-	return consts
+	return
 }
 
 func toCmp(r ssa.Instruction) *ssa.BinOp {
@@ -185,23 +240,15 @@ func isBoolean(t types.Type) bool {
 	return tb != nil && tb.Kind() == types.Bool
 }
 
-type constraint struct {
-	val       ssa.Value
-	op        int
-	typedFrom *ssa.BasicBlock
-	bound     ssa.Instruction
-	accesses  []ssa.Value
-}
-
-func findFieldAccesses(c *constraint) {
+func (ctx *context) findFieldAccesses(c *constraint) {
 	for _, r := range *c.val.Referrers() {
 		switch f := r.(type) {
 		case *ssa.Field:
-			if f.Field == opfield {
+			if f.Field == ctx.opField {
 				continue
 			}
 		case *ssa.FieldAddr:
-			if f.Field == opfield {
+			if f.Field == ctx.opField {
 				continue
 			}
 		default:
@@ -212,58 +259,6 @@ func findFieldAccesses(c *constraint) {
 		}
 		c.accesses = append(c.accesses, r.(ssa.Value))
 	}
-}
-
-func findNodeType(sprog *ssa.Program, lprog *loader.Program) {
-	pkg := sprog.ImportedPackage("cmd/compile/internal/gc")
-	if pkg == nil {
-		fatalln("could not find cmd/compile/internal/gc in ssa")
-	}
-	obj := pkg.Type("Node")
-	if obj == nil {
-		fatalln("could not find Node in ssa")
-	}
-	typ := obj.Type()
-	structtype := typ.Underlying().(*types.Struct)
-	numFields := structtype.NumFields()
-
-	lpkg := lprog.Package("cmd/compile/internal/gc")
-
-	cspecs := findTypeConsts(lpkg.Files)
-	fieldstouched = make([]big.Int, len(cspecs))
-	names = make([]string, len(cspecs))
-	for _, s := range cspecs {
-		decl := s.(*ast.ValueSpec)
-		val, _ := exact.Int64Val(lpkg.Info.Defs[decl.Names[0]].(*types.Const).Val())
-		names[val] = decl.Names[0].Name
-	}
-
-	for i := 0; i < numFields; i++ {
-		f := structtype.Field(i)
-		if f.Name() == "Op" {
-			nodetype = typ
-			opfield = i
-			return
-		}
-	}
-	fatalln("could not find Op field")
-}
-
-func findTypeConsts(files []*ast.File) []ast.Spec {
-	for _, f := range files {
-		for _, d := range f.Decls {
-			gd, ok := d.(*ast.GenDecl)
-			if !ok || gd.Tok != token.CONST {
-				continue
-			}
-			decl := gd.Specs[0].(*ast.ValueSpec)
-			if decl.Names[0].Name == "OXXX" {
-				return gd.Specs
-			}
-		}
-	}
-	fatalln("could not find type consts")
-	panic("unreachable")
 }
 
 func fatalf(s string, i ...interface{}) {
