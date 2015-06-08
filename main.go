@@ -21,7 +21,7 @@ var printTypes = flag.Bool("types", false, "print final types")
 type context struct {
 	loaderprog    *loader.Program
 	ssaprog       *ssa.Program
-	constraints   []*constraint
+	constraints   map[constraintKey]*constraint
 	nodetype      types.Type
 	opField       int
 	opNames       []string
@@ -149,6 +149,11 @@ type constraint struct {
 	accesses  []ssa.Value
 }
 
+type constraintKey struct {
+	typedFrom *ssa.BasicBlock
+	val       ssa.Value
+}
+
 func (ctx *context) generateConstraints(i ssa.Instruction) {
 	switch field := i.(type) {
 	case *ssa.Field:
@@ -174,7 +179,7 @@ func (ctx *context) generateConstraints(i ssa.Instruction) {
 					continue
 				}
 				val := constval.Int64()
-				ctx.constraints = append(ctx.constraints, &constraint{
+				ctx.addConstraint(&constraint{
 					val:       field.X,
 					op:        int(val),
 					typedFrom: store.Block(),
@@ -207,10 +212,7 @@ func (ctx *context) findJumpsOnCmp(instr ssa.Instruction, load ssa.Value, base s
 			if binop.Op == token.NEQ {
 				tblock = bb.Succs[1]
 			}
-			if !bb.Dominates(tblock) {
-				continue
-			}
-			ctx.constraints = append(ctx.constraints, &constraint{
+			ctx.addConstraint(&constraint{
 				val:       base,
 				op:        int(val),
 				typedFrom: tblock,
@@ -241,6 +243,27 @@ func isBoolean(t types.Type) bool {
 }
 
 func (ctx *context) findFieldAccesses(c *constraint) {
+	var stack []*ssa.BasicBlock
+	blocks := make(map[*ssa.BasicBlock]bool)
+	stack = append(stack, c.typedFrom)
+	for len(stack) > 0 {
+		b := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if blocks[b] {
+			continue
+		}
+		blocks[b] = true
+		for _, s := range b.Succs {
+			ec, ok := ctx.constraints[constraintKey{
+				typedFrom: s,
+				val:       c.val,
+			}]
+			if ok && ec.typedFrom != c.typedFrom {
+				continue
+			}
+			stack = append(stack, s)
+		}
+	}
 	for _, r := range *c.val.Referrers() {
 		switch f := r.(type) {
 		case *ssa.Field:
@@ -254,11 +277,25 @@ func (ctx *context) findFieldAccesses(c *constraint) {
 		default:
 			continue
 		}
-		if !c.typedFrom.Dominates(r.Block()) {
+		if !blocks[r.Block()] {
 			continue
 		}
 		c.accesses = append(c.accesses, r.(ssa.Value))
 	}
+}
+
+func (ctx *context) addConstraint(c *constraint) {
+	if ctx.constraints == nil {
+		ctx.constraints = make(map[constraintKey]*constraint)
+	}
+	ck := constraintKey{
+		typedFrom: c.typedFrom,
+		val:       c.val,
+	}
+	if _, ok := ctx.constraints[ck]; ok {
+		return
+	}
+	ctx.constraints[ck] = c
 }
 
 func fatalf(s string, i ...interface{}) {
